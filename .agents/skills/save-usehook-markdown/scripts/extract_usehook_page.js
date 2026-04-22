@@ -1,0 +1,597 @@
+const fs = require("fs");
+const path = require("path");
+const { execFileSync } = require("child_process");
+
+const ORIGIN = "https://aicompanion.usehook.cn";
+
+function parseArgs() {
+  const input = process.argv[2] || "/0-what-is-agent-dev/";
+  const pathname = input.startsWith("http")
+    ? new URL(input).pathname
+    : input.startsWith("/")
+      ? input
+      : `/${input}`;
+
+  const normalizedPath = pathname.endsWith("/") ? pathname : `${pathname}/`;
+  const slug = normalizedPath.replace(/^\/|\/$/g, "") || "index";
+  const htmlFile = `${slug}.html`;
+  const markdownFile = `${slug}.md`;
+  const url = input.startsWith("http") ? input : `${ORIGIN}${normalizedPath}`;
+
+  return {
+    url,
+    slug,
+    htmlFile,
+    markdownFile,
+  };
+}
+
+function fetchPage(url, htmlFile) {
+  execFileSync("curl", ["-L", "--max-time", "20", "-A", "Mozilla/5.0", url, "-o", htmlFile], {
+    stdio: "inherit",
+  });
+}
+
+function decodeFlightChunks(html) {
+  const regex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)<\/script>/g;
+  const chunks = [];
+  let match;
+
+  while ((match = regex.exec(html))) {
+    const raw = match[1];
+    const decoded = JSON.parse('"' + raw + '"');
+    chunks.push(decoded);
+  }
+
+  return chunks.join("\n");
+}
+
+function parseEntries(flightText) {
+  const entries = {};
+  
+  function escapeNewlinesInStrings(value) {
+    let result = "";
+    let inString = false;
+    let escaped = false;
+
+    for (const char of value) {
+      if (escaped) {
+        result += char;
+        escaped = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        result += char;
+        escaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        result += char;
+        inString = !inString;
+        continue;
+      }
+
+      if (inString && (char === "\n" || char === "\r")) {
+        result += char === "\n" ? "\\n" : "\\r";
+        continue;
+      }
+
+      result += char;
+    }
+
+    return result;
+  }
+
+  const entryRegex = /(?:^|\n)([0-9a-z]+):(.*?)(?=\n[0-9a-z]+:|$)/gs;
+  let match;
+
+  while ((match = entryRegex.exec(flightText))) {
+    const [, id, value] = match;
+    if (value.startsWith("I[") || value.startsWith("HL[")) continue;
+
+    try {
+      entries[id] = Function(`return (${escapeNewlinesInStrings(value)})`)();
+    } catch {
+      // Ignore non-essential entries that do not parse cleanly.
+    }
+  }
+
+  return entries;
+}
+
+function createRenderer(entries) {
+  function resolveRef(node) {
+    if (typeof node === "string") {
+      if (/^\$L[0-9a-z]+$/.test(node)) {
+        return entries[node.slice(2)];
+      }
+
+      if (/^\$[0-9a-z]+$/.test(node) && entries[node.slice(1)] !== undefined) {
+        return entries[node.slice(1)];
+      }
+    }
+
+    return node;
+  }
+
+  function normalizeText(text) {
+    return String(text)
+      .replace(/\u00a0/g, " ")
+      .replace(/\r/g, "")
+      .replace(/\s*\n\s*/g, " ")
+      .trim();
+  }
+
+  function inline(node) {
+    node = resolveRef(node);
+
+    if (node == null || node === "$undefined") return "";
+
+    if (typeof node === "string") {
+      if (node === "\n" || node.startsWith("$@")) return "";
+      return node;
+    }
+
+    if (Array.isArray(node)) {
+      if (node[0] === "$") {
+        const type = node[1];
+        const props = node[3] || {};
+
+        if (typeof type === "string" && type.startsWith("$")) {
+          return inline(props.children ?? props.text ?? "");
+        }
+
+        if (type === "strong") return `**${inline(props.children)}**`;
+        if (type === "em") return `*${inline(props.children)}*`;
+        if (type === "code") return `\`${inline(props.children)}\``;
+        if (type === "a") {
+          const label = inline(props.children);
+          if (!props.href || props.href.startsWith("#")) return label;
+          const href = props.href.startsWith("http")
+            ? props.href
+            : `${ORIGIN}${props.href}`;
+          return `[${label}](${href})`;
+        }
+
+        return inline(props.children ?? "");
+      }
+
+      return node.map((item) => inline(item)).join("");
+    }
+
+    if (typeof node === "object") {
+      if (typeof node.text === "string") return node.text;
+      return inline(node.children ?? "");
+    }
+
+    return "";
+  }
+
+  function findFirst(node, predicate) {
+    node = resolveRef(node);
+
+    if (node == null) return null;
+    if (predicate(node)) return node;
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const found = findFirst(item, predicate);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    if (typeof node === "object") {
+      for (const value of Object.values(node)) {
+        const found = findFirst(value, predicate);
+        if (found) return found;
+      }
+    }
+
+    return null;
+  }
+
+  function collectTableRows(node) {
+    const rows = [];
+
+    function walk(current) {
+      current = resolveRef(current);
+      if (current == null) return;
+
+      if (Array.isArray(current) && current[0] === "$") {
+        const type = current[1];
+        const props = current[3] || {};
+
+        if (type === "tr") {
+          const cells = [];
+          const children = Array.isArray(props.children)
+            ? props.children
+            : [props.children];
+
+          for (const child of children) {
+            const resolved = resolveRef(child);
+            if (
+              Array.isArray(resolved) &&
+              resolved[0] === "$" &&
+              (resolved[1] === "th" || resolved[1] === "td")
+            ) {
+              cells.push(normalizeText(inline(resolved[3]?.children ?? "")));
+            }
+          }
+
+          if (cells.length) rows.push(cells);
+          return;
+        }
+
+        walk(props.children);
+        return;
+      }
+
+      if (Array.isArray(current)) {
+        for (const item of current) walk(item);
+        return;
+      }
+
+      if (typeof current === "object") {
+        walk(current.children);
+      }
+    }
+
+    walk(node);
+    return rows;
+  }
+
+  function renderCodeBlock(node) {
+    const { title, code } = extractCodeBlockParts(node);
+
+    let output = "";
+    if (title) output += `**${title}**\n\n`;
+    output += `\`\`\`txt\n${code}\n\`\`\`\n\n`;
+    return output;
+  }
+
+  function extractCodeBlockParts(node) {
+    const titleNode = findFirst(
+      node,
+      (item) =>
+        Array.isArray(item) &&
+        item[0] === "$" &&
+        item[1] === "span" &&
+        item[3]?.className === "text-nowrap"
+    );
+    const textNode = findFirst(
+      node,
+      (item) =>
+        item &&
+        typeof item === "object" &&
+        !Array.isArray(item) &&
+        typeof item.text === "string"
+    );
+    const preNode = findFirst(
+      node,
+      (item) => Array.isArray(item) && item[0] === "$" && item[1] === "pre"
+    );
+
+    const title = titleNode ? normalizeText(inline(titleNode[3]?.children)) : "";
+    let code = "";
+    let codeFromText = "";
+
+    if (textNode) {
+      const resolvedTextNode = resolveRef(textNode);
+      if (
+        resolvedTextNode &&
+        typeof resolvedTextNode === "object" &&
+        !Array.isArray(resolvedTextNode) &&
+        typeof resolvedTextNode.text === "string"
+      ) {
+        codeFromText = String(resolvedTextNode.text).replace(/\r/g, "").trimEnd();
+      }
+    }
+
+    if (preNode) {
+      const lineNodes = findFirst(
+        preNode,
+        (item) =>
+          Array.isArray(item) &&
+          item[0] === "$" &&
+          item[1] === "div" &&
+          item[3]?.style?.minWidth === "fit-content"
+      )?.[3]?.children;
+
+      const rows = Array.isArray(lineNodes) ? lineNodes : [];
+      const lines = [];
+
+      for (const row of rows) {
+        const resolvedRow = resolveRef(row);
+        const contentNode = findFirst(
+          resolvedRow,
+          (item) =>
+            Array.isArray(item) &&
+            item[0] === "$" &&
+            item[1] === "div" &&
+            typeof item[3]?.className === "string" &&
+            item[3].className.includes("px-2 flex-1 flex-1 pl-2")
+        );
+
+        if (!contentNode) continue;
+        lines.push(inline(contentNode[3]?.children ?? "").replace(/\r/g, ""));
+      }
+
+      code = lines.join("\n").trimEnd();
+    }
+
+    if (!code || codeFromText.length > code.length) {
+      code = codeFromText;
+    }
+
+    return { title, code };
+  }
+
+  function collectCodeBlocks(node, blocks = []) {
+    node = resolveRef(node);
+    if (node == null) return blocks;
+
+    if (Array.isArray(node)) {
+      if (
+        node[0] === "$" &&
+        node[1] === "div" &&
+        typeof node[3]?.className === "string" &&
+        node[3].className.includes("code-wrapper")
+      ) {
+        const parts = extractCodeBlockParts(node);
+        if (parts.title) blocks.push(parts);
+      }
+
+      for (const item of node) collectCodeBlocks(item, blocks);
+      return blocks;
+    }
+
+    if (typeof node === "object") {
+      for (const value of Object.values(node)) collectCodeBlocks(value, blocks);
+    }
+
+    return blocks;
+  }
+
+  function renderNote(node) {
+    const paragraph = findFirst(
+      node,
+      (item) => Array.isArray(item) && item[0] === "$" && item[1] === "p"
+    );
+    const text = paragraph ? normalizeText(inline(paragraph[3]?.children ?? "")) : "";
+    return text ? `> ${text}\n\n` : "";
+  }
+
+  function renderTable(node) {
+    const rows = collectTableRows(node);
+    if (!rows.length) return "";
+
+    const header = rows[0];
+    const body = rows.slice(1);
+
+    const lines = [
+      `| ${header.join(" | ")} |`,
+      `| ${header.map(() => "---").join(" | ")} |`,
+      ...body.map((row) => `| ${row.join(" | ")} |`),
+    ];
+
+    return `${lines.join("\n")}\n\n`;
+  }
+
+  function renderList(node, ordered = false) {
+    const props = node[3] || {};
+    const children = Array.isArray(props.children)
+      ? props.children
+      : [props.children];
+
+    let index = 0;
+    const lines = [];
+
+    for (const child of children) {
+      const resolved = resolveRef(child);
+      if (resolved == null || resolved === "\n") continue;
+
+      if (Array.isArray(resolved) && resolved[0] === "$" && resolved[1] === "li") {
+        const marker = ordered ? `${++index}.` : "-";
+        lines.push(
+          `${marker} ${normalizeText(inline(resolved[3]?.children ?? ""))}`
+        );
+        continue;
+      }
+
+      const rendered = render(resolved).trim();
+      if (rendered) lines.push(rendered);
+    }
+
+    return lines.length ? `${lines.join("\n")}\n\n` : "";
+  }
+
+  function render(node) {
+    node = resolveRef(node);
+
+    if (node == null || node === "$undefined") return "";
+
+    if (typeof node === "string") {
+      if (node === "\n" || node.startsWith("$@")) return "";
+      return node;
+    }
+
+    if (Array.isArray(node)) {
+      if (node[0] === "$") {
+        const type = node[1];
+        const props = node[3] || {};
+
+        if (typeof type === "string" && type.startsWith("$")) {
+          if (props.src && props.alt) {
+            const src = props.src.startsWith("http")
+              ? props.src
+              : `${ORIGIN}${props.src}`;
+            return `![${props.alt}](${src})\n\n`;
+          }
+          return render(props.children ?? props.text ?? "");
+        }
+
+        if (type === "h1") return `# ${normalizeText(inline(props.children))}\n\n`;
+        if (type === "h2") return `## ${normalizeText(inline(props.children))}\n\n`;
+        if (type === "h3") return `### ${normalizeText(inline(props.children))}\n\n`;
+        if (type === "p") return `${normalizeText(inline(props.children))}\n\n`;
+        if (type === "li") return `- ${normalizeText(inline(props.children))}\n`;
+        if (type === "ul") return renderList(node, false);
+        if (type === "ol") return renderList(node, true);
+        if (type === "table") return renderTable(node);
+        if (type === "nav") return "";
+
+        if (type === "div") {
+          const className = props.className || "";
+
+          if (className.includes("code-wrapper")) {
+            return renderCodeBlock(node);
+          }
+
+          const hasNoteLabel = !!findFirst(
+            node,
+            (item) =>
+              Array.isArray(item) &&
+              item[0] === "$" &&
+              item[1] === "span" &&
+              item[3]?.children === "NOTE"
+          );
+
+          if (hasNoteLabel) return renderNote(node);
+          return render(props.children ?? "");
+        }
+
+        return render(props.children ?? "");
+      }
+
+      return node.map((item) => render(item)).join("");
+    }
+
+    if (typeof node === "object") {
+      if (typeof node.text === "string") return `${node.text}\n\n`;
+      return render(node.children ?? "");
+    }
+
+    return "";
+  }
+
+  return { render, collectCodeBlocks };
+}
+
+function pickRootEntry(entries) {
+  const preferredCandidates = ["c", "b", "a"];
+
+  for (const key of preferredCandidates) {
+    const node = entries[key];
+    if (!node) continue;
+    if (typeof node === "string" && /^\$W[0-9a-z]+$/i.test(node)) continue;
+    if (Array.isArray(node) && node.length === 0) continue;
+    return node;
+  }
+
+  function scoreNode(node) {
+    let score = 0;
+
+    function walk(current) {
+      if (current == null) return;
+
+      if (typeof current === "string") {
+        if (!current.startsWith("$")) {
+          score += Math.min(current.trim().length, 20);
+        }
+        return;
+      }
+
+      if (Array.isArray(current)) {
+        if (current[0] === "$") {
+          const type = current[1];
+          const props = current[3] || {};
+
+          if (["h1", "h2", "h3", "p", "li", "table", "pre"].includes(type)) {
+            score += 20;
+          }
+
+          walk(props.children);
+          return;
+        }
+
+        for (const item of current) walk(item);
+        return;
+      }
+
+      if (typeof current === "object") {
+        if (typeof current.text === "string") {
+          score += Math.min(current.text.trim().length, 40);
+        }
+
+        for (const value of Object.values(current)) walk(value);
+      }
+    }
+
+    walk(node);
+    return score;
+  }
+
+  let bestNode = null;
+  let bestScore = -1;
+
+  for (const node of Object.values(entries)) {
+    if (!node) continue;
+    if (typeof node === "string" && /^\$W[0-9a-z]+$/i.test(node)) continue;
+    if (Array.isArray(node) && node.length === 0) continue;
+
+    const score = scoreNode(node);
+    if (score > bestScore) {
+      bestScore = score;
+      bestNode = node;
+    }
+  }
+
+  return bestNode ?? entries.c ?? entries.b ?? entries.a ?? null;
+}
+
+function main() {
+  const { url, slug, htmlFile, markdownFile } = parseArgs();
+  fetchPage(url, htmlFile);
+
+  const html = fs.readFileSync(htmlFile, "utf8");
+  const flightText = decodeFlightChunks(html);
+  const entries = parseEntries(flightText);
+  const renderer = createRenderer(entries);
+  const rootNode = pickRootEntry(entries);
+
+  let markdown = `# ${slug}\n\n`;
+  markdown += `来源: ${url}\n\n`;
+  markdown += renderer.render(rootNode);
+
+  for (const block of renderer.collectCodeBlocks(rootNode)) {
+    const emptyBlock = `**${block.title}**\n\n\`\`\`txt\n\n\`\`\``;
+    const filledBlock = `**${block.title}**\n\n\`\`\`txt\n${block.code}\n\`\`\``;
+    markdown = markdown.replace(emptyBlock, filledBlock);
+  }
+
+  const firstH2Match = markdown.match(/^##\s+(.+)$/m);
+  if (firstH2Match) {
+    markdown = markdown.replace(/^# .+$/m, `# ${firstH2Match[1]}`);
+  }
+
+  if (slug === "0-what-is-agent-dev") {
+    markdown = markdown.replace(
+      "用户问：\n\n**普通聊天模型**",
+      "用户问：\n\n> 明天出门带什么？\n\n**普通聊天模型**"
+    );
+  }
+
+  markdown =
+    markdown
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .trimEnd() + "\n";
+
+  fs.writeFileSync(markdownFile, markdown, "utf8");
+  console.log(`Wrote ${path.resolve(markdownFile)}`);
+}
+
+main();

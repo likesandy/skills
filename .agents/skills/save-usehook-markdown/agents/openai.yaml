@@ -1,0 +1,7 @@
+interface:
+  display_name: "Save Usehook Markdown"
+  short_description: "Save usehook article pages as local Markdown."
+  default_prompt: "Use $save-usehook-markdown to fetch a usehook article URL and save it as Markdown in my current directory."
+
+policy:
+  allow_implicit_invocation: true
