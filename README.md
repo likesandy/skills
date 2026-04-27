@@ -12,6 +12,7 @@
 ## 已包含的技能
 
 - `save-usehook-markdown`：抓取 `aicompanion.usehook.cn` 的文章页面并保存为 Markdown 文件
+- `git-commit-message`：根据当前 Git 工作区变更生成 git-cz 兼容的提交信息
 
 ## 说明
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Commit Message"
+  short_description: "Generate git-cz commit messages"
+  default_prompt: "Use $git-commit-message to generate a git-cz compatible commit message for the current code changes."
