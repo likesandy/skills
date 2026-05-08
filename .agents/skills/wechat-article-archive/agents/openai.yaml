@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信文章离线归档"
+  short_description: "传一个文章地址生成离线资源包"
+  default_prompt: "Use $wechat-article-archive with one WeChat article URL. Locate the already-existing local WebView page copy from the local WeChat profile, extract the article body, and archive it into an offline folder with local image references and local video/N.mp4 placeholders."

@@ -13,6 +13,7 @@
 
 - `save-usehook-markdown`：抓取 `aicompanion.usehook.cn` 的文章页面并保存为 Markdown 文件
 - `git-commit-message`：根据当前 Git 工作区变更生成 git-cz 兼容的提交信息
+- `wechat-article-archive`：将微信文章 URL 打包为可离线查看的本地归档目录，包含正文、图片和视频占位信息(目前只支持mac)
 
 ## 说明
 
